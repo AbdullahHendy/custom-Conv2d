@@ -2,143 +2,175 @@
 
 namespace eecs471 {
 
-__global__ void matrixMultiplyTiled(float *A, float *B, float *C, int numARows,
-                                    int numAColumns, int numBRows, int numBColumns,
-                                    int numCRows, int numCColumns) {
-    //@@ Insert code to implement matrix multiplication here
-    //@@ You have to use shared memory for this kernel
-    // Constant tile size
-    const int TILE_SIZE = 32;
-    // Define the shared memory arrays for A and B
-    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
-    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
+    // An example use of these macros:
+    // float a = y4d(0,0,0,0)
+    // y4d(0,0,0,0) = a
+    #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+    #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+    #define w4d(i3, i2, i1, i0) w[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
-    // Define row and column indices
-    int row = blockDim.y * blockIdx.y + threadIdx.y;
-    int col = blockDim.x * blockIdx.x + threadIdx.x;
+    #define TILE_SIZE 32
 
-    float temp = 0;
-    // for each tile
-    for (int k = 0; k < (numAColumns + TILE_SIZE - 1) / TILE_SIZE; k++) {
-        // Load data into shared memory keeping in mind boundary conditions for tiles and matrices dimensions
-        // Checking for last tile in case A or B "width/cols" is not multiple of TILE_SIZE
-        if (k * TILE_SIZE + threadIdx.x < numAColumns && row < numARows)
-            tileA[threadIdx.y][threadIdx.x] = A[row * numAColumns + (k * TILE_SIZE + threadIdx.x)];
-        else
-            tileA[threadIdx.y][threadIdx.x] = 0.0f;
-        if (k * TILE_SIZE + threadIdx.y < numBRows && col < numBColumns)
-            tileB[threadIdx.y][threadIdx.x] = B[(k * TILE_SIZE + threadIdx.y) * numBColumns + col];
-        else
-            tileB[threadIdx.y][threadIdx.x] = 0.0f;
-        // Wait for all threads to finish loading data into shared memory
-        __syncthreads();
+    // Multiplies w_unrolled (M, C*K*K) with x_unrolled (C*K*K, B*H_out*W_out) = (M, B*H_out*W_out)
+    // This will produce output y (B, M, H_out, W_out)
+    // w_unrolled * x_unrolled = y (x and w are both unrolled on-the-fly inside the kernel)
+    __global__ void implicitGemmConv(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
+                                    int B, int C, int H, int W, int K, int H_out, int W_out, int M) {
 
-        // Compute the partial product (dot product of the row of A and column of B)
-        for (int n = 0; n < TILE_SIZE; n++) {
-            temp += tileA[threadIdx.y][n] * tileB[n][threadIdx.x];
+        // Define the shared memory arrays for W (Filter) and X (Activation Patch)
+        __shared__ float tileW[TILE_SIZE][TILE_SIZE];
+        __shared__ float tileX[TILE_SIZE][TILE_SIZE];
+
+        int row = blockDim.y * blockIdx.y + threadIdx.y; // Output row index (corresponds to M in W)
+        int col = blockDim.x * blockIdx.x + threadIdx.x; // Output col index (corresponds to N in X_unrolled)
+
+        float temp = 0.0f;
+        const int num_w_cols = C * K * K; // This is the K dimension in GEMM = num_x_unrolled_rows
+
+        // ---------------------------------------------------------------------------------
+
+        // The loop iterates over the inner dimension (K dimension = C*K*K) in tiles.
+        #pragma unroll
+        for (int tile_idx = 0; tile_idx < (num_w_cols + TILE_SIZE - 1) / TILE_SIZE; tile_idx++) {
+            
+            // 1. Load W_unrolled Tile into Shared Memory (tileW)
+            // Unroll W on-the-fly from (M, C, K, K) to (M, C*K*K). This is matrix 'A' in GEMM.
+            // W is an M x K matrix. Load the tile corresponding to output rows 'row' and inner dim 'tile_idx'
+
+            // w_inner_idx specifies the row within the tile being loaded
+            int w_inner_idx = tile_idx * TILE_SIZE + threadIdx.x;
+            if (row < M && w_inner_idx < num_w_cols) {
+                // Decode the row (m) into (m). Nothing to decode since m is the first dim of W.
+                int m = row;
+
+                // Decode the w_inner_idx to get (c, p, q), which are the channel and filter indices
+                // The dimensions are nested as: c (slowest changing) --> p (medium) --> q (fastest changing).
+                // Below c is K*K dims, below p is K dims
+                int c = w_inner_idx / (K * K); // Get the channel index by dividing w_inner_idx by the dims under it (K*K)
+                int pq_idx = w_inner_idx % (K * K); // Get the index within the K*K block
+                int p = pq_idx / K; // Get the filter row index by dividing the index within K*K by the dims under it (K)
+                int q = pq_idx % K; // Get the filter column index by taking modulus K
+
+                tileW[threadIdx.y][threadIdx.x] = w4d(m, c, p, q);
+            } else {
+                tileW[threadIdx.y][threadIdx.x] = 0.0f;
+            }
+
+            // 2. Load X_unrolled Tile into Shared Memory (tileX) ---
+            // Unroll X on-the-fly from (B, C, H, W) to (C*K*K, B*H_out*W_out). This is matrix 'B' in GEMM.
+            // X_unrolled is a K x N matrix. Load the tile corresponding to inner dim 'tile_idx' and output columns 'col'.
+            
+            // x_inner_idx specifies the row within the tile being loaded
+            int x_inner_idx = tile_idx * TILE_SIZE + threadIdx.y;
+            // Check if the current thread is within the bounds of the implicit X_unrolled matrix's K dimension
+            if (x_inner_idx < num_w_cols && col < B * H_out * W_out) {
+                
+                // Decode the x_inner_idx to get (c, p, q), which are the channel and filter indices
+                // The dimensions are nested as: c (slowest changing) --> p (medium) --> q (fastest changing).
+                // Below c is K*K dims, below p is K dims
+                int c = x_inner_idx / (K * K); // Get the channel index by dividing x_inner_idx by the dims under it (K*K)
+                int pq_idx = x_inner_idx % (K * K); // Get the index within the K*K block
+                int p = pq_idx / K; // Get the filter row index by dividing the index within K*K by the dims under it (K)
+                int q = pq_idx % K; // Get the filter column index by taking modulus K
+
+
+                // Decode the column to get (b, h_out, w_out), which are the batch index and output spatial indices
+                // The dimensions are nested as: b (slowest changing) --> h_out (medium) --> w_out (fastest changing).
+                // Below b is H_out*W_out dims, below h_out is W_out dims                
+                int b = col / (H_out * W_out); // Get the batch index by dividing col by the dims under it (H_out*W_out)
+                int hw_out_idx = col % (H_out * W_out); // Get the index within the H_out*W_out block
+                int h_out = hw_out_idx / W_out; // Get the output height index by dividing the index within H_out*W_out by the dims under it (W_out)
+                int w_out = hw_out_idx % W_out; // Get the output width index by taking modulus W_out
+
+
+                // Calculate the corresponding input spatial indices to pull from x
+                // At this point, the indices b and c are already correct. 
+                // The output position (h_out, w_out) indicates where the top-left corner of the filter is positioned on the input image (see Lecture 16 slide 59). 
+                // The filter offset (p,q) tells us which element within that patch we are looking for.
+                int h_in = h_out + p;
+                int w_in = w_out + q;
+                
+                // Bounds check for the original input X 
+                if (b < B && c < C && h_in < H && w_in < W) {
+                    // Load the value from X into the Shared Memory tile
+                    tileX[threadIdx.y][threadIdx.x] = x4d(b, c, h_in, w_in);
+                } else {
+                    tileX[threadIdx.y][threadIdx.x] = 0.0f;
+                }
+            } else {
+                // Out of bounds, zero out the tile element
+                tileX[threadIdx.y][threadIdx.x] = 0.0f;
+            }
+            
+            // Wait for all threads to finish loading data into shared memory
+            __syncthreads();
+
+            // 3. Compute the Partial Product (accumulate into temp)
+            #pragma unroll
+            for (int n = 0; n < TILE_SIZE; n++) {
+                // W[row, n] * X[n, col]
+                temp += tileW[threadIdx.y][n] * tileX[n][threadIdx.x]; 
+            }
+            
+            // Wait for all threads to finish computing before loading new data
+            __syncthreads();
         }
-        // Wait for all threads to finish computing before loading new data into shared memory
-        __syncthreads();
+
+        // 4. Write the Result to Global Memory (Output Y)
+        // Write the result to global memory if within bounds
+        if (row < M && col < B * H_out * W_out) {
+
+            // Same logic as above to decode row and col back to (b, m, h_out, w_out)
+            // Same row decoding as W and same col decoding as X_unrolled
+            
+            int m = row;
+            
+            int b = col / (H_out * W_out);
+            int hw_out_idx = col % (H_out * W_out);
+            int h_out = hw_out_idx / W_out;
+            int w_out = hw_out_idx % W_out;
+            
+            // Write the accumulated result into the 4D output tensor Y.
+            y4d(b, m, h_out, w_out) = temp;
+        }
     }
 
-    // Write the result to global memory if within bounds
-    if (row < numCRows && col < numCColumns) {
-        C[row * numCColumns + col] = temp;
-    }
-}
+    torch::Tensor forward(const torch::Tensor &x, const torch::Tensor &w, int64_t M) {
+        // // Unchanged Logic
+        const int B = x.size(0);
+        const int C = x.size(1);
+        const int H = x.size(2);
+        const int W = x.size(3);
+        const int K = w.size(3);
+        const int H_out = H - K + 1;
+        const int W_out = W - K + 1;
 
-// An example use of these macros:
-// float a = y4d(0,0,0,0)
-// y4d(0,0,0,0) = a
-#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+        // Allocate tensor for the final output Y (B, M, H_out, W_out)
+        auto y = torch::empty({B, M, H_out, W_out}, x.options());
 
-// Im2col-style kernel to convert input batch images (B, C, H, W) into 2D column matrix (C*K*K, B*H_out*W_out)
-__global__ void x_unroll_kernel(const float *x, float *x_unrolled, const int B, const int C, const int H, const int W, const int K, const int H_out, const int W_out) {
-    // Each thread processes one element in the unrolled matrix
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+        // W gets unrolled on-the-fly inside the kernel from (M, C, K, K) to (M, C*K*K)
+        // X gets unrolled on-the-fly inside the kernel from (B, C, H, W) to (C*K*K, B*H_out*W_out)
 
-    // Total number of elements being processed
-    int total_elements = C * K * K * B * H_out * W_out;
-
-    // TODO: Check if we coudl get rid of it by launching exact number 
-    // No bounds check since we are gonna launch exact number of threads
-    if (idx >= total_elements) return;
-
-    // Find row and column that this thread is responsible for. Num of columns = B * H_out * W_out
-    // Finding the row and column will give us a "patch" in all images (all channels) in the batch
-    // e.g. for idx = 0, we get row = 0, col = 0, which corresponds to the top-left KxK patch of all channels in the first image in the batch
-    // See slide 59 in Lecture 16 for visualization
-    int row = idx / (B * H_out * W_out);
-    int col = idx % (B * H_out * W_out);
+        // Number of rows in the implicit W_unrolled is M (M dimension of A in GEMM)
+        const int MM = M;
+        // Number of columns in the implicit X_unrolled is B * H_out * W_out (N dimension of B in GEMM)
+        const int NN = B * H_out * W_out; 
 
 
-    // Decode the row to get (c, p, q), which are the channel and filter indices
-    int c = row / (K * K);
-    int p = (row / K) % K;
-    int q = row % K;
+        // Each block computes a tile of the M x N output matrix.
+        dim3 gridDim((NN + TILE_SIZE - 1) / TILE_SIZE, (MM + TILE_SIZE - 1) / TILE_SIZE);
+        dim3 blockDim(TILE_SIZE, TILE_SIZE);
 
-    // Decode the column to get (b, h_out, w_out), which are the batch index and output spatial indices
-    int b = col / (H_out * W_out);
-    int h_out = (col / W_out) % H_out;
-    int w_out = col % W_out;
-
-    // Calculate the corresponding input spatial indices to pull from x
-    int h_in = h_out + p;
-    int w_in = w_out + q;
-
-    // Copy the value from x to the unrolled matrix
-    x_unrolled[idx] = x4d(b, c, h_in, w_in);
-}
-
-#undef y4d
-#undef x4d
-#undef k4d
-
-torch::Tensor forward(const torch::Tensor &x, const torch::Tensor &w, int64_t M) {
-    const int B = x.size(0);
-    const int C = x.size(1);
-    const int H = x.size(2);
-    const int W = x.size(3);
-    const int K = w.size(3);
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-
-    // Allocate tensor for unrolled x (C*K*K, B*H_out*W_out)
-    auto x_unrolled = torch::empty({C * K * K, B * H_out * W_out}, x.options());
-
-    // Launch kernel to unroll x into x_unrolled
-    {
-        // TODO: Maybe launch exact number of threads instead of doing bounds check in kernel
-        // since we know the total number of elements to process in both conv layers
-        dim3 gridDim((C * K * K * B * H_out * W_out + 511) / 512);
-        dim3 blockDim(512);
-
-        x_unroll_kernel<<<gridDim, blockDim>>>(x.data_ptr<float>(), x_unrolled.data_ptr<float>(), B, C, H, W, K, H_out, W_out);
+        // Launch the implicit GEMM convolution kernel to perform W_unrolled * X_unrolled = Y
+        implicitGemmConv<<<gridDim, blockDim>>>(
+            w.data_ptr<float>(),
+            x.data_ptr<float>(),
+            y.data_ptr<float>(),
+            B, C, H, W, K, H_out, W_out, M);
+        
+        // Y is already in the correct shape (B, M, H_out, W_out) because of how it was allocated
+        return y;
     }
 
-    // Reshape (unroll) w from (M, C, K, K) to (M, C*K*K)
-    auto w_unrolled = w.view({M, C * K * K});
 
-    // Allocate unrolled output y_unrolled (M, B*H_out*W_out) to perform matrix multiplication
-    auto y_unrolled = torch::empty({M, B * H_out * W_out}, x.options());
-
-    // Launch tiled matrix multiplication kernel to compute y_unrolled = w_unrolled * x_unrolled
-    {
-        dim3 gridDim((B * H_out * W_out + 31) / 32, (M + 31) / 32);
-        dim3 blockDim(32, 32);
-
-        matrixMultiplyTiled<<<gridDim, blockDim>>>(
-            w_unrolled.data_ptr<float>(), x_unrolled.data_ptr<float>(), y_unrolled.data_ptr<float>(),
-            M, C * K * K,
-            C * K * K, B * H_out * W_out,
-            M, B * H_out * W_out);
-    }
-
-    // Reshape y_unrolled back to (B, M, H_out, W_out)
-    auto y = y_unrolled.view({M, B, H_out, W_out}).permute({1, 0, 2, 3}).contiguous();
-
-    return y;
-}
 }; // namespace eecs471
