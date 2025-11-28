@@ -51,17 +51,12 @@ namespace eecs471 {
         // W gets unrolled on-the-fly inside the kernel from (M, C, K, K) to (M, C*K*K)
         // X gets unrolled on-the-fly inside the kernel from (B, C, H, W) to (C*K*K, B*H_out*W_out)
         else if (B == 10000 && C == 12 && H == 33 && W == 33 && K == 7 && M == 24 && H_out == 27 && W_out == 27) {
-            constexpr int TILE_M = 24; // Picked to match M
-            // The Tiles loop (based on TILE_K) will have exactly 49 full iterations (12*7*7 / 24 = 49) 
-            constexpr int TILE_K = 24; // Each of the 24 threads in y dim will load 1 element of tileX.
-            constexpr int TILE_N = 24; // 24 * 24 = 576 threads per block, which is under 1024. 576/32 = 18 warps.
-
             // Each block computes a tile of the M x N output matrix.
-            dim3 gridDim((NN + TILE_N - 1) / TILE_N, (MM + TILE_M - 1) / TILE_M);
-            dim3 blockDim(TILE_N, TILE_M);
+            dim3 gridDim((NN + BN - 1) / BN, (MM + BM - 1) / BM);
+            dim3 blockDim(WARPS_PER_BLOCK * WARP_SIZE, 1, 1);
 
             // Launch the implicit GEMM convolution kernel to perform W_unrolled * X_unrolled = Y
-            implicitUnrollTiledGemmConv<10000, 24, 12, 33, 33, 7, 27, 27, TILE_M, TILE_K, TILE_N><<<gridDim, blockDim>>>(
+            implicitUnrollWmmaTC<10000, 24, 12, 33, 33, 7, 27, 27><<<gridDim, blockDim>>>(
                 w.data_ptr<float>(),
                 x.data_ptr<float>(),
                 y.data_ptr<float>());
