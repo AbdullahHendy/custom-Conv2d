@@ -25,8 +25,8 @@ namespace eecs471 {
     #define WMMA_N 16
     #define WMMA_K 16
 
-    // Padding to avoid shared memory bank conflicts
-    #define PAD 8 // 4-way conflict. but can we do better?
+    // Padding to reduce shared memory bank conflicts
+    #define PAD 8
 
     // This kernel uses WMMA to perform the implicit GEMM convolution and unrolls W and X on-the-fly.
     // This kernels works in heirarchical manner:
@@ -71,9 +71,21 @@ namespace eecs471 {
 
         // 1. Shared Memory (Padded for Bank Conflicts)
         // We later convert Float -> Half during the load to SMEM since inputs are Floats
-        __shared__ half smem_W[BM][BK + PAD]; 
-        __shared__ half smem_X[BK][BN + PAD]; 
-        __shared__ float smem_Y[BM][BN + PAD];
+        // Using union to reduce shared memory usage since we only don't need W and X after compute and we dont need Y before compute
+        __shared__ union {
+            struct {
+                half sW[BM][BK + PAD];
+                half sX[BN][BK + PAD]; // Transposed
+            } in;
+            struct {
+                float sY[BM][BN + PAD];
+            } out;
+        } smem;
+        // Helper pointers
+        half (*smem_W)[BK + PAD] = smem.in.sW;
+        half (*smem_X)[BK + PAD] = smem.in.sX;
+        float (*smem_Y)[BN + PAD] = smem.out.sY;
+
 
         // 2. Setup Accumulators
         // Accumulators within each warp we have WM/WMMA_M in the M dimension and WN/WMMA_N in the N dimension.
@@ -91,7 +103,7 @@ namespace eecs471 {
         // Each warp computes WM/WMMA_M fragments in M dimension and WN/WMMA_N fragments in N dimension.
         // In the case of WM=16, WN=32, WMMA_M=16, WMMA_N=16, each warp has 1 fragment in M dimension and 2 fragments in N dimension.
         wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[num_m_frags];
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[num_n_frags];
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[num_n_frags];
 
         // 3. Main Loop over K (GEMM_K = 588)
         // We step through GEMM_K in chunks of BK i.e. the width of our TILE in K dimension
@@ -102,24 +114,44 @@ namespace eecs471 {
             // In the case of 4 WARPS_PER_BLOCK, each block has 4*32 = 128 threads
             // In the case of BM=32, BK=16, each block loads 32*16 = 512 elements
             // Therefore, each thread loads 512 / 128 = 4 elements
-            // NOTE: We are doing strided loads for coalescing. Instead of thread 0 loading elements 0,1,2,3, it loads 0,128,256,384
+            // Vectorization:
+            // Instead of each thread loading (BM * BK) / (WARPS_PER_BLOCK * WARP_SIZE) elements one by one, 
+            // load 4 at a time using float4 for better memory throughput
+            // In the above case of 4 elements per thread, each thread loads exactly 1 vector of float4
             // NOTE: We dont unroll W since it is "contiguous" in memory already (M, C, K, K) and we want W to be (M, C*K*K)
-            const int elements_per_thread_W = (BM * BK) / (WARPS_PER_BLOCK * WARP_SIZE); // 4
-            for (int i = 0; i < elements_per_thread_W; i++) {
-                int idx = tid + i * (WARPS_PER_BLOCK * WARP_SIZE);
-                // Decode idx into (r, c) within the tile since idx goes from 0 to BM*BK-1
-                // In the case of BM=32, BK=16, r in [0..31], c in [0..15]
-                int r = idx / BK;
-                int c = idx % BK;
+            const int VECTOR_SIZE = 4; // Number of floats in a float4
+            const int total_vectors = (BM * BK) / VECTOR_SIZE; // Total number of float4 vectors to load for one W tile
+            const int vectors_per_thread = total_vectors / (WARPS_PER_BLOCK * WARP_SIZE); // Number of float4 vectors each thread loads
+            const int vectors_per_row = BK / VECTOR_SIZE; // Number of float4 vectors per row in the W tile
+
+            const float4* W_vec_ptr = reinterpret_cast<const float4*>(W_global); // cast W_global to float4 pointer for vectorized loads
+
+            // TODO: This loop doesn't generalize and might wanna change it later if we need to test other TILE sizes (BM, BK, BN)
+            for (int i = 0; i < vectors_per_thread; i++) { // In the above case, this loop runs 1 time
+                int vec_idx = tid + i * (WARPS_PER_BLOCK * WARP_SIZE); // Stride by total threads in block for better coalescing
+                // Decode vec_idx into (r, c) within the tile since vec_idx goes from 0 to (BM*BK)/VECTOR_SIZE - 1
+                // In the case of BM=32, BK=16, r in [0..31], c in [0..3] since there are 4 vectors per row
+                int r = vec_idx / vectors_per_row;
+                int vec_c = vec_idx % vectors_per_row;
+                int c = vec_c * VECTOR_SIZE; // Convert vector column index to actual element column index
 
                 int globalRow = blockRow + r;
                 int globalCol = k_step + c;
 
                 if (globalRow < M && globalCol < GEMM_K) {
-                    float val = W_global[globalRow * GEMM_K + globalCol]; // globalRow is M dim, globalCol is C*K*K dim
-                    smem_W[r][c] = __float2half(val);
+                    float4 vec_val = W_vec_ptr[(globalRow * GEMM_K + globalCol) / VECTOR_SIZE]; // globalRow is M dim, globalCol is C*K*K dim
+
+                    // Store the 4 elements into shared memory as half
+                    smem_W[r][c + 0] = __float2half(vec_val.x);
+                    smem_W[r][c + 1] = __float2half(vec_val.y);
+                    smem_W[r][c + 2] = __float2half(vec_val.z);
+                    smem_W[r][c + 3] = __float2half(vec_val.w);
+
                 } else {
-                    smem_W[r][c] = __float2half(0.0f);
+                    smem_W[r][c + 0] = __float2half(0.0f);
+                    smem_W[r][c + 1] = __float2half(0.0f);
+                    smem_W[r][c + 2] = __float2half(0.0f);
+                    smem_W[r][c + 3] = __float2half(0.0f);
                 }
             }
 
@@ -181,7 +213,7 @@ namespace eecs471 {
                         val = __float2half(X_global[x_idx]);
                     }
                 }
-                smem_X[r][c] = val;
+                smem_X[c][r] = val; // Write transposed into shared memory
             }
 
             // Make sure the tiles are loaded before using them
@@ -204,10 +236,10 @@ namespace eecs471 {
                     wmma::load_matrix_sync(a_frag[i], ptrW, BK + PAD); // Load into a_frag starting from ptrW and stride BK + PAD
                 }
 
-                // Load B fragments from shared memory
+                // Load B fragments from shared memory (transposed)
                 for (int j = 0; j < num_n_frags; ++j) {
-                    half* ptrX = &smem_X[sub_k][warpCol + j * WMMA_N];
-                    wmma::load_matrix_sync(b_frag[j], ptrX, BN + PAD); // Load into b_frag starting from ptrX and stride BN + PAD
+                    half* ptrX = &smem_X[warpCol + j * WMMA_N][sub_k];
+                    wmma::load_matrix_sync(b_frag[j], ptrX, BK + PAD); // Load into b_frag starting from ptrX and stride BK + PAD
                 }
 
                 // Matrix Multiply-Accumulate using WMMA
