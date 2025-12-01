@@ -72,17 +72,18 @@ namespace eecs471 {
         // 1. Shared Memory (Padded for Bank Conflicts)
         // We later convert Float -> Half during the load to SMEM since inputs are Floats
         // Using union to reduce shared memory usage since we only don't need W and X after compute and we dont need Y before compute
+        // Transpose W and X in shared memory for better memory access patterns during WMMA load
         __shared__ union {
             struct {
-                half sW[BM][BK + PAD];
-                half sX[BN][BK + PAD]; // Transposed
+                half sW[BK][BM + PAD];
+                half sX[BN][BK + PAD];
             } in;
             struct {
                 float sY[BM][BN + PAD];
             } out;
         } smem;
         // Helper pointers
-        half (*smem_W)[BK + PAD] = smem.in.sW;
+        half (*smem_W)[BM + PAD] = smem.in.sW;
         half (*smem_X)[BK + PAD] = smem.in.sX;
         float (*smem_Y)[BN + PAD] = smem.out.sY;
 
@@ -102,7 +103,7 @@ namespace eecs471 {
         // 3. Fragments for WMMA
         // Each warp computes WM/WMMA_M fragments in M dimension and WN/WMMA_N fragments in N dimension.
         // In the case of WM=16, WN=32, WMMA_M=16, WMMA_N=16, each warp has 1 fragment in M dimension and 2 fragments in N dimension.
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[num_m_frags];
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag[num_m_frags];
         wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[num_n_frags];
 
         // 3. Main Loop over K (GEMM_K = 588)
@@ -142,16 +143,16 @@ namespace eecs471 {
                     float4 vec_val = W_vec_ptr[(globalRow * GEMM_K + globalCol) / VECTOR_SIZE]; // globalRow is M dim, globalCol is C*K*K dim
 
                     // Store the 4 elements into shared memory as half
-                    smem_W[r][c + 0] = __float2half(vec_val.x);
-                    smem_W[r][c + 1] = __float2half(vec_val.y);
-                    smem_W[r][c + 2] = __float2half(vec_val.z);
-                    smem_W[r][c + 3] = __float2half(vec_val.w);
+                    smem_W[c + 0][r] = __float2half(vec_val.x);
+                    smem_W[c + 1][r] = __float2half(vec_val.y);
+                    smem_W[c + 2][r] = __float2half(vec_val.z);
+                    smem_W[c + 3][r] = __float2half(vec_val.w);
 
                 } else {
-                    smem_W[r][c + 0] = __float2half(0.0f);
-                    smem_W[r][c + 1] = __float2half(0.0f);
-                    smem_W[r][c + 2] = __float2half(0.0f);
-                    smem_W[r][c + 3] = __float2half(0.0f);
+                    smem_W[c + 0][r] = __float2half(0.0f);
+                    smem_W[c + 1][r] = __float2half(0.0f);
+                    smem_W[c + 2][r] = __float2half(0.0f);
+                    smem_W[c + 3][r] = __float2half(0.0f);
                 }
             }
 
@@ -163,13 +164,20 @@ namespace eecs471 {
             // Therefore, each thread loads 1024 / 128 = 8 elements
             // NOTE: We are doing strided loads for coalescing. Instead of thread 0 loading elements 0,1,2,3, it loads 0,128,256,384
             // NOTE: We need to unroll X from (B, C, H, W) to (C*K*K, B*H_out*W_out) on-the-fly during the load into shared memory
+            
+            // NOTE: The following static assert is to ensure that WARRPS_PER_BLOCK * WARP_SIZE is a multiple of BN
+            // Given that condition then c = idx % BN = tid % BN (idx = tid + i * WARPS_PER_BLOCK * WARP_SIZE) (tid doesn't depend on i but idx does)
+            // This allows the compiler to take c calculation (modulus operation) and other variables dependent on it
+            // out of the loop since tid is constant for a thread
+            static_assert((WARPS_PER_BLOCK * WARP_SIZE) % BN == 0, "WARPS_PER_BLOCK * WARP_SIZE must be multiple of BN");
+            
             const int elements_per_thread_X = (BK * BN) / (WARPS_PER_BLOCK * WARP_SIZE); // 8
             for (int i = 0; i < elements_per_thread_X; i++) {
                 int idx = tid + i * WARPS_PER_BLOCK * WARP_SIZE;
                 // Decode idx into (r, c) within the tile since idx goes from 0 to BK*BN-1
                 // In the case of BK=16, BN=64, r in [0..15], c in [0..63]
                 int r = idx / BN;
-                int c = idx % BN;
+                int c = tid % BN; // idx % BN = tid % BN due to static_assert above
 
                 int global_k = k_step + r;
                 int global_n = blockCol + c;
@@ -230,10 +238,10 @@ namespace eecs471 {
                 // In the case of WM=16, WN=32, WMMA_M=16, WMMA_N=16, each warp has 1 fragment in M dimension and 2 fragments in N dimension.
                 // We calculated those values earlier as num_m_frags and num_n_frags
 
-                // Load A fragments from shared memory and B fragments from shared memory
+                // Load A fragments from shared memory (transposed)
                 for (int i = 0; i < num_m_frags; ++i) {
-                    half* ptrW = &smem_W[warpRow + i * WMMA_M][sub_k];
-                    wmma::load_matrix_sync(a_frag[i], ptrW, BK + PAD); // Load into a_frag starting from ptrW and stride BK + PAD
+                    half* ptrW = &smem_W[sub_k][warpRow + i * WMMA_M];
+                    wmma::load_matrix_sync(a_frag[i], ptrW, BM + PAD); // Load into a_frag starting from ptrW and stride BM + PAD
                 }
 
                 // Load B fragments from shared memory (transposed)
